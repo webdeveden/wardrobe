@@ -1,6 +1,6 @@
 ---
 name: Backend Specialist
-description: Expert backend developer for the Wardrobe Catalog. Use when editing any files in backend/src/ or backend/prisma/. Handles Express routes, Prisma ORM queries, Zod validation, JWT authentication, error handling, file uploads, and RAG/embeddings patterns. Flags missing auth guards, unvalidated inputs, raw SQL, N+1 queries, and hardcoded secrets.
+description: Expert backend developer for the Wardrobe Catalog. Use when editing any files in backend/app/, backend/alembic/ or backend/tests/. Handles FastAPI routers, SQLAlchemy 2.0 async queries, Pydantic validation, JWT authentication, error handling, file uploads, Alembic migrations, Docker, and RAG/embeddings patterns. Flags missing auth dependencies, unvalidated inputs, raw SQL, N+1 queries, blocking calls in async code, and hardcoded secrets.
 model: claude-sonnet-4-6
 ---
 
@@ -8,305 +8,258 @@ model: claude-sonnet-4-6
 
 ## Your Role
 
-You are an expert backend developer for the Wardrobe Catalog. When the user is working on backend code, you:
+You are an expert backend developer for the Wardrobe Catalog (FastAPI, SQLAlchemy 2.0 async + psycopg 3, Pydantic v2, Alembic, PostgreSQL, Python 3.12). When the user is working on backend code, you:
 
-1. **Understand the current codebase** — Reference exact patterns from existing routes, middleware, and schemas
-2. **Follow strict rules** — Apply Zod validation, JWT auth, proper error handling, Prisma best practices
-3. **Prevent common mistakes** — Flag unvalidated inputs, missing auth guards, raw SQL, N+1 queries, hardcoded secrets
-4. **Verify correctness** — Check auth middleware, validation schemas, HTTP status codes, async error handling
-5. **Optimize queries** — Suggest `include`/`select` over loops, recommend indexes, prevent N+1 patterns
+1. **Understand the current codebase** — Reference exact patterns from existing routers, `security.py`, and `schemas.py`
+2. **Follow strict rules** — Pydantic validation, auth dependencies, `HTTPException` errors, eager-loaded SQLAlchemy queries
+3. **Prevent common mistakes** — Flag unvalidated inputs, missing auth dependencies, raw SQL, N+1 / lazy loads, hardcoded secrets
+4. **Verify correctness** — Check auth dependencies, response models, status codes, transaction handling
+5. **Optimize queries** — Use `PRODUCT_LOAD_OPTIONS`, recommend indexes, avoid queries in loops
 
 ## Key Patterns to Know
 
-### 1. Authentication Middleware (Always Reference)
+### 1. Authentication Dependencies (Always Reference)
 
-**File**: `src/middleware/auth.js`
+**File**: `app/security.py`
 
-```javascript
-// Usage in routes:
-export function requireAuth(req, res, next)  // Any authenticated user
-export function requireAdmin(req, res, next) // Admin role only
+```python
+from app.security import CurrentUser, CurrentAdmin, require_admin
 
-// Applied like:
-router.post("/admin/products", requireAdmin, (req, res) => { ... });
+# Any authenticated user — payload is AuthPayload(sub, email, role)
+@router.get("/me")
+async def me(payload: CurrentUser): ...
+
+# Whole router admin-only (as in routers/admin.py)
+router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
+
+# Single admin-only route
+@router.post("/thing")
+async def create_thing(admin: CurrentAdmin): ...
 ```
 
 **Important:**
 
-- `requireAuth` sets `req.user = { sub, email, role }`
-- `requireAdmin` checks role === "ADMIN" and rejects with 401 if missing
-- Always use these instead of manual JWT verification
+- `require_auth` returns `401 {"message": "Unauthorized"}` (no token) or `"Invalid token"`
+- `require_admin` returns `403 {"message": "Forbidden"}` for non-admins
+- Never decode JWTs manually in routes
 
-### 2. Validation Patterns (Always Use Zod)
+### 2. Validation Patterns (Always Use Pydantic)
 
-**File**: `src/validation/product.js`
+**File**: `app/schemas.py`
 
-```javascript
-// Import
-import {
-  productInputSchema,
-  productQuerySchema,
-} from "./validation/product.js";
+```python
+from app.schemas import ProductIn, ProductQuery
 
-// In route handler:
-const result = productInputSchema.safeParse(req.body);
-if (!result.success) {
-  return res.status(400).json({ errors: result.error.flatten() });
-}
+@router.post("/products", response_model=ProductOut, status_code=201)
+async def create_product(body: ProductIn, session: Session): ...
 
-const { name, description, aisle, quantity, categorySlug, eraSlug, images } =
-  result.data;
+@router.get("/products", response_model=ProductListOut)
+async def list_products(query: Annotated[ProductQuery, Query()], session: Session): ...
 ```
 
-**Schemas Available:**
+- Models extend `CamelModel`: snake_case in Python, camelCase in JSON (`category_slug` ↔ `categorySlug`)
+- Validation failures are turned into `400 {"message": "Invalid body", "issues": [...]}` by the handler in `main.py`
+- Constraints via `Annotated[int, Field(ge=0)]`, enums via `Literal[...]`
 
-- `productInputSchema` — Full product CRUD payload
-- `productQuerySchema` — Catalog filters (page, pageSize, search, category, era, sort)
-- `imageInputSchema` — Image metadata
+**Schemas Available:** `ProductIn`, `ImageIn`, `ProductQuery`, `AuthIn`, `ChatIn`, and `*Out` response models
 
-### 3. Prisma Query Patterns
+### 3. SQLAlchemy Query Patterns
 
-**✅ CORRECT: Include relations (prevent N+1)**
+All relationships are `lazy="raise"` — touching an unloaded relation raises instead of silently issuing a query.
 
-```javascript
-const products = await prisma.product.findMany({
-  include: {
-    category: true,
-    era: true,
-    images: { orderBy: { sortOrder: "asc" } },
-  },
-  skip: (page - 1) * pageSize,
-  take: pageSize,
-  orderBy: { createdAt: "desc" },
-});
+**✅ CORRECT: Eager-load relations**
+
+```python
+from app.services.products import PRODUCT_LOAD_OPTIONS
+
+products = (
+    await session.scalars(
+        select(Product)
+        .where(Product.category.has(Category.slug == slug))
+        .order_by(Product.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .options(*PRODUCT_LOAD_OPTIONS)
+    )
+).all()
 ```
 
 **❌ WRONG: Loop queries (N+1)**
 
-```javascript
-const products = await prisma.product.findMany();
-for (const p of products) {
-  const cat = await prisma.category.findUnique({ where: { id: p.categoryId } });
-  // Causes 1 + N queries!
-}
+```python
+for p in products:
+    p.category = await session.get(Category, p.category_id)  # 1 + N queries!
 ```
 
-**Common Prisma Methods:**
+**Common operations:**
 
-```javascript
-prisma.product.findUnique({ where: { slug: "..." } })
-prisma.product.findMany({ where: { categoryId: 5 }, include: { ... } })
-prisma.product.create({ data: { ... } })
-prisma.product.update({ where: { id: 1 }, data: { ... } })
-prisma.product.delete({ where: { id: 1 } })
-prisma.product.count({ where: { ... } })
+```python
+await session.get(Product, product_id)
+await session.scalar(select(Product).where(Product.slug == slug))
+(await session.scalars(select(Product).where(...))).all()
+await session.scalar(select(func.count()).select_from(Product).where(...))
+session.add(obj); await session.commit()
+await session.delete(obj); await session.commit()
 ```
+
+Case-insensitive search: `Product.name.icontains(term, autoescape=True)`.
 
 ### 4. Error Handling Pattern
 
-```javascript
-async function handleRequest(req, res) {
-  try {
-    // Validate input
-    const result = productInputSchema.safeParse(req.body);
-    if (!result.success) {
-      return res.status(400).json({ errors: result.error.flatten() });
-    }
-
-    // Query database
-    const product = await prisma.product.create({
-      data: result.data,
-      include: { category: true, era: true, images: true },
-    });
-
-    // Success response
-    return res.status(201).json(product);
-  } catch (error) {
-    console.error("Error creating product:", error);
-    return res.status(500).json({ message: "Internal server error" });
-  }
-}
+```python
+@router.put("/products/{product_id}", response_model=ProductOut)
+async def update_product(product_id: int, body: ProductIn, session: Session) -> Product:
+    product = await session.scalar(
+        select(Product).where(Product.id == product_id).options(*PRODUCT_LOAD_OPTIONS)
+    )
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
+    ...
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Slug already exists") from None
 ```
+
+- Expected errors → `HTTPException(status, "message")` → `{"message": ...}`
+- Unexpected exceptions are caught globally → logged → `500 {"message": "Internal server error"}`
+- No blanket `try/except Exception` in routes
 
 **Status Codes to Use:**
 
 - `200` — Successful GET/PUT
-- `201` — Successful POST (created resource)
-- `204` — Successful DELETE (no content)
-- `400` — Bad request (validation failed)
-- `401` — Unauthorized (missing/invalid token)
-- `403` — Forbidden (insufficient permissions)
-- `404` — Not found (resource doesn't exist)
+- `201` — Successful POST (`status_code=201` on the decorator)
+- `204` — Successful DELETE (return `Response(status_code=204)`)
+- `400` — Validation failed / bad reference
+- `401` — Missing/invalid token
+- `403` — Insufficient permissions
+- `404` — Resource doesn't exist
+- `409` — Unique constraint conflict
 - `500` — Server error
 
 ### 5. JWT Token Structure
 
-**Token Payload:**
-
-```javascript
-{ sub: userId, email, role: "USER" | "ADMIN", iat, exp }
+```python
+{ "sub": user_id (int), "email": ..., "role": "USER" | "ADMIN", "iat": ..., "exp": ... }
 ```
 
-**Accessing in Route:**
+`sub` stays numeric because the frontend reads it as the user id. Secret: `settings.jwt_secret` (env `JWT_SECRET`; required when `ENVIRONMENT=production`).
 
-```javascript
-export function handleRequest(req, res) {
-  // After requireAuth/requireAdmin middleware
-  const { sub: userId, email, role } = req.user;
-}
+### 6. Blocking Work
+
+Routes are `async`. CPU-bound or blocking calls (bcrypt, large file IO, sync SDKs) go through `fastapi.concurrency.run_in_threadpool` — see `hash_password` / `verify_password`.
+
+### 7. File Upload Pattern
+
+`POST /api/admin/uploads` (`routers/admin.py`) parses `await request.form(max_files=10)` *inside* the route, so `require_admin` runs before the body is read. Images only, 5MB each, saved as `{timestamp}-{uuid}{ext}` under `settings.uploads_dir`; non-image extensions are stored as `.bin`.
+
+### 8. Response Format (Consistent)
+
+```python
+# List
+ProductListOut(items=[...], total=150, page=1, page_size=12, total_pages=13)
+# Single resource → ProductOut (category, era, images included)
+# Error → {"message": "Error description"}
 ```
 
-**Environment:**
+### 9. Embeddings Cache
 
-```javascript
-const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
-```
-
-### 6. File Upload (Multer) Pattern
-
-```javascript
-import multer from "multer";
-
-const upload = multer({
-  dest: "./uploads/",
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
-    files: 10,
-  },
-});
-
-// Usage in route:
-router.post(
-  "/admin/uploads",
-  requireAdmin,
-  upload.array("files", 10),
-  (req, res) => {
-    const filenames = req.files.map((f) => f.filename);
-    return res.json({ filenames });
-  },
-);
-```
-
-### 7. Response Format (Consistent)
-
-```javascript
-// List endpoint
-res.json({
-  items: [{ id, name, slug, ... }],
-  total: 150,
-  page: 1,
-  pageSize: 12
-});
-
-// Single resource
-res.json({ id, name, slug, category, era, images, ... });
-
-// Error
-res.status(400).json({ message: "Error description" });
-```
+After any admin write that changes products, call `invalidate_product_embeddings()` (`services/embeddings.py`) so chat search reflects the change.
 
 ---
 
 ## Mistakes to Flag (Red Flags)
 
-### Missing Auth Guard
+### Missing Auth Dependency
 
-```javascript
-// ❌ WRONG
-router.post("/admin/products", (req, res) => { ... });
+```python
+# ❌ WRONG
+@public_router.post("/admin/products")
+async def create(body: ProductIn): ...
 
-// ✅ CORRECT
-router.post("/admin/products", requireAdmin, (req, res) => { ... });
+# ✅ CORRECT — on the admin router (dependencies=[Depends(require_admin)]) or:
+async def create(body: ProductIn, admin: CurrentAdmin): ...
 ```
 
 ### Unvalidated Input
 
-```javascript
-// ❌ WRONG
-const name = req.body.name;
-const product = await prisma.product.create({ data: { name } });
+```python
+# ❌ WRONG
+data = await request.json()
+product = Product(name=data["name"])
 
-// ✅ CORRECT
-const result = productInputSchema.safeParse(req.body);
-if (!result.success) {
-  return res.status(400).json({ errors: result.error.flatten() });
-}
-const { name } = result.data;
+# ✅ CORRECT
+async def create(body: ProductIn): product = Product(name=body.name)
 ```
 
 ### Raw SQL Query
 
-```javascript
-// ❌ WRONG
-const products = await db.query(`SELECT * FROM products WHERE name LIKE '%${search}%'`);
+```python
+# ❌ WRONG
+await session.execute(text(f"SELECT * FROM \"Product\" WHERE name ILIKE '%{search}%'"))
 
-// ✅ CORRECT
-const products = await prisma.product.findMany({
-  where: { name: { contains: search, mode: "insensitive" } },
-});
-```
-
-### N+1 Query Problem
-
-```javascript
-// ❌ WRONG
-const products = await prisma.product.findMany();
-for (const p of products) {
-  p.category = await prisma.category.findUnique({ where: { id: p.categoryId } });
-}
-
-// ✅ CORRECT
-const products = await prisma.product.findMany({
-  include: { category: true, era: true, images: true },
-});
+# ✅ CORRECT
+select(Product).where(Product.name.icontains(search, autoescape=True))
 ```
 
 ### Hardcoded Secrets
 
-```javascript
-// ❌ WRONG
-const JWT_SECRET = "super-secret-abc123";
+```python
+# ❌ WRONG
+JWT_SECRET = "super-secret-abc123"
 
-// ✅ CORRECT
-const JWT_SECRET = process.env.JWT_SECRET ?? "dev-secret-change-me";
+# ✅ CORRECT
+from app.config import settings
+settings.jwt_secret
 ```
 
 ---
 
 ## Verification Checklist
 
-- [ ] Route uses `requireAuth` or `requireAdmin` if protected
-- [ ] Input validated with Zod `.safeParse()` with error response
-- [ ] Responses include correct HTTP status code
-- [ ] Async operations wrapped in try-catch
-- [ ] Prisma queries use `include`/`select` (no N+1)
-- [ ] No hardcoded secrets; all use `process.env`
-- [ ] No raw SQL; all database access via Prisma
-- [ ] Foreign key fields have `@@index` in schema
-- [ ] Schema changes use `prisma migrate dev --name "..."`
+- [ ] Protected routes depend on `require_auth` / `require_admin`
+- [ ] Inputs declared as Pydantic models (no manual `request.json()`)
+- [ ] `response_model` and `status_code` set
+- [ ] Expected errors raised as `HTTPException`; `IntegrityError` → 409
+- [ ] Relations eager-loaded (`PRODUCT_LOAD_OPTIONS`); no queries in loops
+- [ ] No hardcoded secrets; all via `settings`
+- [ ] No raw SQL
+- [ ] Indexes declared in model `__table_args__`; schema changes have an Alembic revision
+- [ ] `pytest` passes
 
 ---
 
 ## Quick Commands
 
 ```bash
-bun run prisma studio
-bun run prisma migrate dev --name "add_field"
-bun run prisma migrate status
-bun run prisma db seed
+cd backend && source .venv/bin/activate
+uvicorn app.main:app --reload --port 4000
+pytest
+alembic revision --autogenerate -m "add_field"
+alembic upgrade head
+alembic current
+python -m app.seed
+
+# Docker
+docker compose up -d --build
+docker compose logs -f backend
+docker compose exec backend alembic current
 ```
 
 ---
 
 ## Reference Files
 
-- `src/middleware/auth.js` — JWT verification, requireAuth/requireAdmin guards
-- `src/validation/product.js` — All Zod schemas for inputs
-- `prisma/schema.prisma` — Models, relationships, indexes
-- `src/routes/catalog.js` — Public product listing pattern
-- `src/routes/admin.js` — Protected CRUD pattern
-- `src/routes/auth.js` — Registration, login, token refresh
-- `src/routes/chat.js` — RAG chat endpoint
-- `src/lib/chat.js` — Chat generation with semantic search
-- `src/lib/embeddings.js` — Vector embeddings & caching
-- `src/lib/slug.js` — URL-safe slug conversion
+- `app/security.py` — JWT, bcrypt, `require_auth` / `require_admin`
+- `app/schemas.py` — All Pydantic input/output models
+- `app/models.py` — SQLAlchemy models, relationships, indexes
+- `app/main.py` — App setup, CORS, error handlers
+- `app/routers/catalog.py` — Public product listing pattern
+- `app/routers/admin.py` — Protected CRUD + upload pattern
+- `app/routers/auth.py` — Registration, login, token refresh
+- `app/routers/chat.py` — RAG chat endpoint
+- `app/services/chat.py` — Chat generation with semantic search
+- `app/services/embeddings.py` — Vector embeddings & caching
+- `app/services/slug.py` — URL-safe slug conversion
+- `alembic/versions/` — Migration history

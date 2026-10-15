@@ -5,11 +5,12 @@
 **Wardrobe House Catalog** is a full-stack e-commerce style inventory management system for wardrobe and photography inventory with AI-powered recommendations.
 
 - **Frontend**: Vue 3, Vite, Tailwind CSS, Pinia (state management), Vue Router
-- **Backend**: Express.js 5.x, Prisma ORM, PostgreSQL, Zod validation
-- **Runtime**: Bun
-- **AI**: OpenAI/OpenRouter embeddings + GPT-4o-mini for RAG-based chat
-- **Auth**: JWT (HS256) + bcryptjs for password hashing
-- **File Uploads**: Multer (5MB max, 10 file limit)
+- **Backend**: FastAPI (Python 3.12), SQLAlchemy 2.0 async ORM (psycopg 3), Pydantic v2 validation, Alembic migrations
+- **Runtime**: Bun (frontend), uvicorn (backend)
+- **AI**: OpenRouter embeddings + GPT-4o-mini for RAG-based chat (`openai` Python SDK)
+- **Auth**: JWT (HS256, PyJWT) + `bcrypt` for password hashing
+- **File Uploads**: multipart form (5MB max per file, 10 file limit, images only)
+- **Containers**: Docker Compose (`db`, `backend`, `frontend` via nginx)
 
 ---
 
@@ -18,26 +19,29 @@
 ### Backend (`/backend`)
 
 ```
-src/
-  ├── index.js              # Express server entry
-  ├── db.js                 # Prisma client initialization
-  ├── middleware/
-  │   └── auth.js           # JWT verification & guards (requireAuth, requireAdmin)
-  ├── routes/
-  │   ├── catalog.js        # Public product listing, search, filters
-  │   ├── admin.js          # Protected CRUD operations
-  │   ├── auth.js           # Register, login, token refresh
-  │   └── chat.js           # RAG-based AI chat endpoint
-  ├── validation/
-  │   └── product.js        # Zod schemas for all inputs
-  └── lib/
-      ├── chat.js           # Chat generation with semantic search
-      ├── embeddings.js     # Vector embeddings & caching
-      └── slug.js           # URL-safe slug conversion
-prisma/
-  ├── schema.prisma         # Database models & relationships
-  ├── seed.js               # Database seeding script
-  └── migrations/           # Additive migration history
+app/
+  ├── main.py               # FastAPI app, CORS, /uploads static mount, error handlers
+  ├── config.py             # Settings from env/.env (pydantic-settings)
+  ├── db.py                 # Async engine + get_session dependency
+  ├── models.py             # SQLAlchemy models (tables keep camelCase column names)
+  ├── schemas.py            # Pydantic input/output schemas (camelCase JSON)
+  ├── security.py           # JWT, bcrypt, require_auth / require_admin dependencies
+  ├── seed.py               # `python -m app.seed`
+  ├── data/mock-products.json
+  ├── routers/
+  │   ├── catalog.py        # Public product listing, search, filters
+  │   ├── admin.py          # Protected CRUD + uploads
+  │   ├── auth.py           # Register, login, /me token refresh
+  │   └── chat.py           # RAG-based AI chat endpoint
+  └── services/
+      ├── chat.py           # Chat generation with semantic search
+      ├── embeddings.py     # Vector embeddings & in-memory cache
+      ├── llm.py            # Shared OpenRouter client
+      ├── products.py       # PRODUCT_LOAD_OPTIONS (eager loading)
+      └── slug.py           # URL-safe slug conversion
+alembic/versions/           # Additive migration history
+tests/                      # pytest
+Dockerfile, docker-entrypoint.sh  # runs `alembic upgrade head` then uvicorn
 ```
 
 ### Frontend (`/frontend`)
@@ -73,34 +77,39 @@ src/
 - **Token Storage**: localStorage (key: `wardrobe-auth-token`)
 - **Token Format**: Bearer token in `Authorization` header (`Bearer <token>`)
 - **Token Payload**: `{ sub: userId, email, role: "USER" | "ADMIN", iat, exp }`
-- **Secret**: `process.env.JWT_SECRET` (required in production, `"dev-secret-change-me"` for dev)
+- **Secret**: `JWT_SECRET` env var via `settings.jwt_secret` (required when `ENVIRONMENT=production`, `"dev-secret-change-me"` for dev)
 - **Algorithm**: HS256
 - **Token Expiry**: Always check `exp * 1000 > Date.now()` before using cached token
 - **Refresh**: Call `GET /api/auth/me` on app load to refresh token state
 
-### Auth Middleware Usage
+### Auth Dependencies
 
-```javascript
-// In route handlers, ALWAYS use one of these:
-export function requireAuth(req, res, next)  // Any authenticated user
-export function requireAdmin(req, res, next) // Admin role required
+```python
+from app.security import CurrentUser, CurrentAdmin, require_admin
+
+@router.get("/me")
+async def me(payload: CurrentUser): ...          # Any authenticated user
+
+router = APIRouter(dependencies=[Depends(require_admin)])  # Admin role required
 ```
 
-### Zod Validation (All Inputs)
+### Pydantic Validation (All Inputs)
 
-- **Location**: `backend/src/validation/product.js`
-- **Pattern**: Parse + validate all request bodies, query params, file uploads
-- **Example**: `productInputSchema.parse(req.body)` or `.safeParse()` for error handling
+- **Location**: `backend/app/schemas.py`
+- **Pattern**: Declare the body/query as a Pydantic model in the route signature; FastAPI validates it
+- **Errors**: Validation failures return `400 { message, issues }` (handler in `main.py`)
+- **JSON casing**: Models extend `CamelModel` — Python uses snake_case, JSON uses camelCase
 - **Schemas available**:
-  - `productInputSchema` — CRUD product fields
-  - `productQuerySchema` — Catalog filters, pagination, search
-  - `imageInputSchema` — Image metadata (url, alt, sortOrder)
+  - `ProductIn` — CRUD product fields
+  - `ProductQuery` — Catalog filters, pagination, search (`Annotated[ProductQuery, Query()]`)
+  - `ImageIn` — Image metadata (url, alt, sortOrder)
+  - `AuthIn`, `ChatIn`, and `*Out` response models
 
 ### Password Hashing
 
-- **Library**: `bcryptjs`
+- **Library**: `bcrypt` (via `hash_password` / `verify_password` in `app/security.py`)
 - **Pattern**: Always hash passwords before storing (never plain text)
-- **Verify**: Use `bcryptjs.compare(plainPassword, hash)` in login routes
+- **Verify**: `await verify_password(plain, user.password_hash)`; hashes from the old bcryptjs backend still verify
 
 ---
 
@@ -123,7 +132,7 @@ export function requireAdmin(req, res, next) // Admin role required
 - `POST /api/admin/products` — Create new product
 - `PUT /api/admin/products/:id` — Update product
 - `DELETE /api/admin/products/:id` — Delete product
-- `POST /api/admin/uploads` — Upload images (Multer: 5MB, 10 files max)
+- `POST /api/admin/uploads` — Upload images (5MB, 10 files max)
 
 ### RAG Chat (Semantic Search)
 
@@ -136,16 +145,16 @@ export function requireAdmin(req, res, next) // Admin role required
 ### Product Slug Generation
 
 - **Pattern**: Lowercase, spaces → hyphens, special chars removed
-- **Unique**: Enforced in Prisma schema (`slug` is `@unique`)
+- **Unique**: Enforced by the `Product_slug_key` unique index (duplicate → 409)
 - **Usage**: Used in URLs & API routes (e.g., `/products/red-wool-coat`)
 
-### File Upload (Multer)
+### File Upload
 
-- **Destination**: `./uploads/` directory
+- **Destination**: `UPLOADS_DIR` (default `./uploads/`; Docker volume at `/app/uploads`)
 - **Max File Size**: 5MB per file
 - **Max Files**: 10 files per request
-- **Naming**: `{timestamp}-{uuid}{extension}` (auto-generated)
-- **Serving**: Express static middleware serves via `/uploads/{filename}`
+- **Naming**: `{timestamp}-{uuid}{extension}` (non-image extensions stored as `.bin`)
+- **Serving**: FastAPI `StaticFiles` mount at `/uploads/{filename}`
 
 ### Pagination
 
@@ -156,9 +165,11 @@ export function requireAdmin(req, res, next) // Admin role required
 
 ---
 
-## Database Schema (Prisma)
+## Database Schema (SQLAlchemy, `app/models.py`)
 
-```prisma
+Tables were originally created by Prisma; names and camelCase columns are kept as-is.
+
+```text
 User (id, email, passwordHash, role: USER|ADMIN, createdAt, updatedAt)
   └─ Unique: email, role enum
 
@@ -196,38 +207,39 @@ ProductImage (id, productId, url, alt, sortOrder)
 
 ❌ **Missing Auth Guards**
 
-- New admin routes must use `requireAdmin` middleware, not just `requireAuth`
+- New admin routes must depend on `require_admin`, not just `require_auth`
 - Chat endpoint is public but should include rate limiting if needed
 
 ❌ **Unvalidated Inputs**
 
-- ALWAYS validate request body/params with Zod before accessing
-- Use `.safeParse()` for proper error handling
-- Example: `const result = productInputSchema.safeParse(req.body); if (!result.success) return res.status(400).json({ errors: result.error.flatten() });`
+- Never read `await request.json()` directly — declare a Pydantic model parameter
+- Add constraints with `Annotated[..., Field(...)]` in `schemas.py`
 
 ❌ **Raw SQL Queries**
 
-- NEVER write raw SQL (e.g., `SELECT * FROM products WHERE name LIKE ...`)
-- Use Prisma methods: `findMany()`, `findUnique()`, `create()`, `update()`, etc.
-- Risk: SQL injection vulnerabilities
+- NEVER write raw SQL strings or `text()` with interpolated values
+- Use SQLAlchemy `select()`, `session.get()`, `session.add()`, etc.
 
 ❌ **Missing Error Handling**
 
-- All async operations must have try-catch
-- Response must include proper HTTP status codes (200, 201, 400, 401, 403, 404, 500)
-- Example: `catch (error) { return res.status(500).json({ message: error.message }); }`
+- Raise `HTTPException(status, "message")` for expected errors (rendered as `{ "message": ... }`)
+- Unexpected exceptions are logged and returned as `500 { "message": "Internal server error" }`
+- Catch `IntegrityError` for unique-constraint races and return 409
 
 ❌ **Hardcoded Secrets**
 
-- All secrets (JWT_SECRET, OpenAI API key, etc.) must come from `process.env`
-- Never commit `.env` files
-- Use `.env.example` as template with placeholder values
+- All secrets (JWT_SECRET, OPENROUTER_API_KEY, etc.) come from env via `app/config.py`
+- Never commit `.env` files; use `.env.example` as template
 
-❌ **N+1 Queries**
+❌ **N+1 Queries / Lazy Loads**
 
-- Load related data with Prisma `include` or `select`, not in loops
-- Example: `prisma.product.findMany({ include: { category: true, era: true, images: true } })`
-- Never: `const products = await prisma.product.findMany(); for (const p of products) { const cat = await prisma.category.findUnique(...); }`
+- Relationships are `lazy="raise"`: accessing an unloaded relation throws
+- Load related data with `.options(*PRODUCT_LOAD_OPTIONS)` (joinedload/selectinload)
+- Never query inside a loop over results
+
+❌ **Blocking the Event Loop**
+
+- Routes are `async`; run CPU-bound or blocking calls (bcrypt, file IO on big files) via `run_in_threadpool`
 
 ### Frontend
 
@@ -264,19 +276,18 @@ ProductImage (id, productId, url, alt, sortOrder)
 
 ❌ **Missing Indexes on Foreign Keys**
 
-- Prisma auto-indexes, but always verify: `@@index([categoryId, eraId])` in schema
-- Missing indexes cause slow queries on large datasets
+- Declare indexes in the model's `__table_args__` (e.g. `Index("Product_categoryId_idx", "categoryId")`)
 
 ❌ **Schema Drift**
 
-- Never manually edit database schema via SQL
-- Always create migrations: `bun run prisma migrate dev --name "description"`
-- Verify with `prisma migrate status` before pushing
+- Never manually edit the database schema via SQL
+- Edit `app/models.py`, then `alembic revision --autogenerate -m "description"` and review the file
+- Verify with `alembic current` / `alembic check` before pushing
 
 ❌ **Breaking Migrations**
 
 - Migrations are additive only—cannot delete columns without data loss consideration
-- If adding `@unique` constraint to existing non-unique column: data must be clean first
+- If adding a unique constraint to an existing non-unique column: data must be clean first
 - Test migrations on dev database before deploying
 
 ---
@@ -288,14 +299,14 @@ ProductImage (id, productId, url, alt, sortOrder)
 **Backend Routes**
 
 - [ ] Route has correct HTTP method (GET/POST/PUT/DELETE)
-- [ ] Auth guard applied (`requireAuth` or `requireAdmin`)
-- [ ] Input validated with Zod (`.safeParse()` with error handling)
-- [ ] Response includes status code (200, 201, 400, 401, 403, 404, 500)
-- [ ] Async errors handled with try-catch
-- [ ] No hardcoded secrets (use `process.env`)
+- [ ] Auth dependency applied (`require_auth` or `require_admin`)
+- [ ] Inputs declared as Pydantic models (no manual `request.json()`)
+- [ ] `response_model` and `status_code` set (200, 201, 204, 400, 401, 403, 404, 409, 500)
+- [ ] Expected errors raised as `HTTPException`
+- [ ] No hardcoded secrets (use `settings`)
 - [ ] No raw SQL queries
-- [ ] Related data loaded with Prisma `include` (no N+1)
-- [ ] Returns valid JSON with consistent structure
+- [ ] Related data eager-loaded (no lazy loads / N+1)
+- [ ] Unit test added in `backend/tests/` where practical
 
 **Frontend Components**
 
@@ -312,52 +323,50 @@ ProductImage (id, productId, url, alt, sortOrder)
 **Database Migrations**
 
 - [ ] Migration file is additive (adds/modifies, never deletes)
-- [ ] Foreign key indexes present (`@@index`)
-- [ ] `@unique` constraints used when needed (slug, email)
-- [ ] @updated datetime field uses `@updatedAt`
+- [ ] Foreign key indexes present
+- [ ] Unique constraints used when needed (slug, email)
+- [ ] `updatedAt` set via `onupdate=utcnow`
 - [ ] Cascade delete configured for dependent records
-- [ ] Migration tested locally with real data (if applicable)
-- [ ] No schema drift between local and schema.prisma
+- [ ] Migration tested locally (`alembic upgrade head` and `alembic downgrade -1`)
 
 ### Local Testing
 
 ```bash
-# Run migrations
-cd backend && bun run prisma migrate dev
+# Full stack in Docker (app on :8080, API on :4000)
+docker compose up -d --build
+docker compose exec backend python -m app.seed
 
-# Seed database (if needed)
-bun run prisma db seed
+# Or: DB in Docker, backend on host with hot reload
+docker compose up -d db
+cd backend && source .venv/bin/activate
+alembic upgrade head
+uvicorn app.main:app --reload --port 4000
+pytest
 
-# Start backend dev server
-bun run dev
-
-# Start frontend dev server
-cd ../frontend && bun run dev
-
-# Check for errors
-# - Backend: No 500 errors in console
-# - Frontend: No errors in browser console
-# - Database: Verify data in Prisma Studio
-bun run prisma studio
+# Frontend dev server
+cd frontend && bun run dev
 ```
 
 ---
 
 ## Environment Variables
 
-### Backend (`.env`)
+### Backend (`backend/.env`)
 
 ```
-DATABASE_URL=postgresql://user:password@localhost:5432/wardrobe
-JWT_SECRET=your-secret-key-here
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/wardrobe_catalog
+JWT_SECRET=your-secret-key-here          # required when ENVIRONMENT=production
+OPENROUTER_API_KEY=sk-or-...
+FRONTEND_ORIGIN=http://localhost:5173    # comma-separated CORS origins
+ENVIRONMENT=development
 ```
+
+Docker Compose overrides `DATABASE_URL`, `PORT`, `FRONTEND_ORIGIN` and `UPLOADS_DIR`.
 
 ### Frontend (`.env.local` or Vite config)
 
 ```
-VITE_API_URL=http://localhost:4000/api
+VITE_API_URL=http://localhost:4000/api   # Docker build uses /api (nginx proxy)
 ```
 
 ---
@@ -366,20 +375,21 @@ VITE_API_URL=http://localhost:4000/api
 
 | Task                    | Pattern                                                         | File                                |
 | ----------------------- | --------------------------------------------------------------- | ----------------------------------- |
-| Add API route           | Use requireAuth/requireAdmin, Zod validation, try-catch         | `backend/src/routes/*.js`           |
+| Add API route           | `require_auth`/`require_admin` dependency, Pydantic models, `HTTPException` | `backend/app/routers/*.py`      |
 | Create component        | Use ref/computed, handle loading/error, call API with try-catch | `frontend/src/components/*.vue`     |
-| Modify schema           | Add migration with `prisma migrate dev --name "..."`            | `backend/prisma/schema.prisma`      |
-| Add validation          | Define Zod schema in `validation/product.js`, parse in routes   | `backend/src/validation/product.js` |
+| Modify schema           | Edit models, `alembic revision --autogenerate -m "..."`          | `backend/app/models.py`             |
+| Add validation          | Define Pydantic model in `schemas.py`, use as route parameter   | `backend/app/schemas.py`            |
 | Handle auth in frontend | Use `authToken`, `authUser`, `isAdmin` computed from auth store | `frontend/src/stores/auth.js`       |
-| Generate embeddings     | Use `EmbeddingsManager` from `lib/embeddings.js`                | `backend/src/lib/embeddings.js`     |
-| Search products         | Use semantic search from `lib/chat.js` context                  | `backend/src/lib/chat.js`           |
+| Generate embeddings     | `get_product_embeddings()` / `invalidate_product_embeddings()`  | `backend/app/services/embeddings.py`|
+| Search products         | `find_relevant_products()`                                      | `backend/app/services/embeddings.py`|
 
 ---
 
 ## Additional Resources
 
-- **Prisma Docs**: https://www.prisma.io/docs
+- **FastAPI Docs**: https://fastapi.tiangolo.com
+- **SQLAlchemy 2.0**: https://docs.sqlalchemy.org/en/20/
+- **Alembic**: https://alembic.sqlalchemy.org
 - **Vue 3 Docs**: https://vuejs.org/guide/
-- **Express Docs**: https://expressjs.com
-- **Zod Docs**: https://zod.dev
+- **Pydantic**: https://docs.pydantic.dev
 - **Tailwind CSS**: https://tailwindcss.com

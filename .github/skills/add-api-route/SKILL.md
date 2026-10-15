@@ -1,6 +1,6 @@
 ---
 name: add-api-route
-description: Add a new Express.js API route to the Wardrobe Catalog backend. Use this skill when creating public catalog endpoints or protected admin routes. Ensures auth guards, Zod validation, try-catch, and consistent response shapes are always applied.
+description: Add a new FastAPI route to the Wardrobe Catalog backend. Use this skill when creating public catalog endpoints or protected admin routes. Ensures auth dependencies, Pydantic validation, HTTPException errors, eager loading, and consistent response models are always applied.
 ---
 
 # Add API Route
@@ -9,78 +9,91 @@ Use this skill when the user asks to add, create, or scaffold a new backend API 
 
 ## Checklist — every route must have all of these
 
-- [ ] Correct HTTP method (`GET`, `POST`, `PUT`, `DELETE`)
-- [ ] Auth guard: `requireAuth` for any logged-in user, `requireAdmin` for admin-only routes
-- [ ] Input validated with a Zod schema using `.safeParse()` — never trust raw `req.body` or `req.query`
-- [ ] Explicit HTTP status codes on every response path (200, 201, 400, 401, 403, 404, 500)
-- [ ] Async handler wrapped in `try-catch` with a 500 fallback
-- [ ] No raw SQL — use Prisma methods (`findMany`, `findUnique`, `create`, `update`, `delete`)
-- [ ] Related data fetched with `include`, never in a loop (no N+1 queries)
-- [ ] No hardcoded secrets — read from `process.env`
-- [ ] Returns JSON with a consistent shape
+- [ ] Correct HTTP method decorator (`@router.get/post/put/delete`)
+- [ ] Auth dependency: `require_auth` for any logged-in user, `require_admin` for admin-only routes
+- [ ] Inputs declared as Pydantic models — never read `request.json()` or raw query params
+- [ ] `response_model=` and `status_code=` set on the decorator
+- [ ] Expected errors raised as `HTTPException(status, "message")` (404 for missing rows, 409 for conflicts)
+- [ ] No raw SQL — use SQLAlchemy `select()`, `session.get()`, `session.add()`, `session.delete()`
+- [ ] Related data eager-loaded with `.options(...)`, never in a loop (relations are `lazy="raise"`)
+- [ ] No hardcoded secrets — read from `app.config.settings`
+- [ ] Router registered in `app/main.py` with `app.include_router(...)` if it's a new file
+- [ ] Test added in `backend/tests/`
 
 ## File locations
 
-- Public routes (no auth): `backend/src/routes/catalog.js`
-- Admin routes: `backend/src/routes/admin.js`
-- Auth routes: `backend/src/routes/auth.js`
-- Chat/RAG: `backend/src/routes/chat.js`
-- Validation schemas: `backend/src/validation/product.js`
-- Auth middleware: `backend/src/middleware/auth.js`
+- Public routes (no auth): `backend/app/routers/catalog.py`
+- Admin routes: `backend/app/routers/admin.py` (router-level `require_admin`)
+- Auth routes: `backend/app/routers/auth.py`
+- Chat/RAG: `backend/app/routers/chat.py`
+- Schemas: `backend/app/schemas.py`
+- Auth dependencies: `backend/app/security.py`
 
 ## Route template
 
-```js
-import { Router } from "express";
-import { requireAdmin } from "../middleware/auth.js";
-import { myInputSchema } from "../validation/product.js";
-import { db } from "../db.js";
+```python
+from typing import Annotated
 
-const router = Router();
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-router.post("/", requireAdmin, async (req, res) => {
-  const result = myInputSchema.safeParse(req.body);
-  if (!result.success) {
-    return res.status(400).json({ errors: result.error.flatten() });
-  }
+from app.db import get_session
+from app.models import Product
+from app.schemas import ProductOut
+from app.security import require_admin
+from app.services.products import PRODUCT_LOAD_OPTIONS
 
-  try {
-    const record = await db.someModel.create({
-      data: result.data,
-      include: { relatedModel: true },
-    });
-    return res.status(201).json(record);
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-});
+router = APIRouter(prefix="/api/things", tags=["things"], dependencies=[Depends(require_admin)])
 
-export default router;
+Session = Annotated[AsyncSession, Depends(get_session)]
+
+
+@router.get("/{product_id}", response_model=ProductOut)
+async def get_thing(product_id: int, session: Session) -> Product:
+    product = await session.scalar(
+        select(Product).where(Product.id == product_id).options(*PRODUCT_LOAD_OPTIONS)
+    )
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
+    return product
 ```
 
-## Auth guards
+## Auth dependencies
 
-```js
-import { requireAuth, requireAdmin } from "../middleware/auth.js";
+```python
+from app.security import CurrentAdmin, CurrentUser
 
-router.get("/me", requireAuth, handler);      // any authenticated user
-router.delete("/:id", requireAdmin, handler); // admin role required
+@router.get("/me")
+async def me(payload: CurrentUser): ...          # any authenticated user
+
+@router.delete("/{id}")
+async def remove(id: int, admin: CurrentAdmin): ...  # admin role required
 ```
 
 ## Pagination pattern
 
-```js
-const { page = 1, pageSize = 12 } = result.data;
-const [items, total] = await Promise.all([
-  db.product.findMany({ skip: (page - 1) * pageSize, take: pageSize }),
-  db.product.count(),
-]);
-return res.json({ items, total, page, pageSize });
+```python
+filters = [...]
+items = (
+    await session.scalars(
+        select(Product).where(*filters)
+        .offset((query.page - 1) * query.page_size).limit(query.page_size)
+        .options(*PRODUCT_LOAD_OPTIONS)
+    )
+).all()
+total = await session.scalar(select(func.count()).select_from(Product).where(*filters)) or 0
+return ProductListOut.model_validate(
+    {"items": items, "total": total, "page": query.page, "page_size": query.page_size,
+     "total_pages": math.ceil(total / query.page_size)}
+)
 ```
 
 ## Common mistakes to avoid
 
-- Do NOT skip the auth guard on admin routes
-- Do NOT access `req.body` fields before Zod parses them
-- Do NOT write `SELECT * FROM ...` — use Prisma
-- Do NOT fetch relations inside a loop — use `include`
+- Do NOT skip the auth dependency on admin routes
+- Do NOT read `request.json()` before Pydantic validates it
+- Do NOT write `text("SELECT ...")` — use SQLAlchemy expressions
+- Do NOT access relationships you didn't eager-load (it raises)
+- Do NOT call blocking functions directly in `async def` — use `run_in_threadpool`
+- Do NOT forget `invalidate_product_embeddings()` after admin writes that change products

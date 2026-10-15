@@ -8,9 +8,48 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: wardrobe_catalog
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wardrobe_catalog"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    # Secrets (JWT_SECRET, OPENROUTER_API_KEY) come from backend/.env when present.
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      # Always use the compose database; set BACKEND_DATABASE_URL to point elsewhere.
+      DATABASE_URL: ${BACKEND_DATABASE_URL:-postgresql://postgres:postgres@db:5432/wardrobe_catalog}
+      PORT: "4000"
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080,http://localhost:5173}
+      UPLOADS_DIR: /app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-4000}:4000"
+    volumes:
+      - uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
 
 volumes:
   postgres_data:
+  uploads:

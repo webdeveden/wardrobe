@@ -1,102 +1,97 @@
 ---
-name: add-zod-schema
-description: Define and wire up a new Zod validation schema in the Wardrobe Catalog backend. Use this skill when adding input validation for new request bodies, query parameters, or file upload metadata. Ensures schemas are defined centrally, used with safeParse, and return structured error responses.
+name: add-pydantic-schema
+description: Define and wire up a new Pydantic validation schema in the Wardrobe Catalog backend. Use this skill when adding input validation for new request bodies, query parameters, or response shapes. Ensures schemas are defined centrally, use camelCase JSON aliases, and produce the project's standard 400 error response.
 ---
 
-# Add Zod Schema
+# Add Pydantic Schema
 
-Use this skill when the user asks to add validation for a new endpoint, request body, or query string.
+Use this skill when the user asks to add validation for a new endpoint, request body, query string, or response.
 
 ## Checklist — every schema must have all of these
 
-- [ ] Schema defined in `backend/src/validation/product.js` (central location)
-- [ ] Used with `.safeParse()` in the route handler, not `.parse()` (avoids unhandled throws)
-- [ ] Failed parse returns `400` with `result.error.flatten()` for structured field errors
-- [ ] Optional fields use `.optional()` or `.default()`
-- [ ] Numbers from query strings coerced with `z.coerce.number()` (query params are always strings)
-- [ ] Enums validated with `z.enum([...])` against known values
-- [ ] Exported from the validation file and imported in the route
+- [ ] Schema defined in `backend/app/schemas.py` (central location)
+- [ ] Extends `CamelModel` so JSON uses camelCase while Python uses snake_case
+- [ ] Used as a typed route parameter (body) or `Annotated[Model, Query()]` (query) — FastAPI validates it
+- [ ] Constraints declared with `Annotated[..., Field(...)]` (`min_length`, `ge`, `le`, ...)
+- [ ] Optional fields typed `X | None = None` or given a default
+- [ ] Fixed value sets use `Literal[...]` (or an `enum.Enum`)
+- [ ] Output models used as `response_model=` on the route
 
 ## File location
 
-- All schemas: `backend/src/validation/product.js`
+- All schemas: `backend/app/schemas.py`
 
 ## Existing schemas (do not duplicate)
 
-- `productInputSchema` — CRUD product fields (name, slug, description, aisle, quantity, categoryId, eraId)
-- `productQuerySchema` — Catalog filters and pagination (search, category, era, sort, page, pageSize)
-- `imageInputSchema` — Image metadata (url, alt, sortOrder)
+- `ProductIn` — CRUD product fields (name, description, aisle, quantity, categorySlug, eraSlug, images)
+- `ImageIn` — Image metadata (url, alt, sortOrder)
+- `ProductQuery` — Catalog filters and pagination (page, pageSize, search, category, era, sort)
+- `AuthIn`, `ChatIn` — Auth and chat bodies
+- `ProductOut`, `ProductListOut`, `CategoryOut`, `EraOut`, `MetaOut`, `AuthOut`, `UploadOut`, `ChatOut` — Responses
+
+Reusable field types: `EmailStr` (from pydantic), `Url`, `UtcDatetime` (serializes as ISO 8601 with `Z`).
 
 ## Schema patterns
 
 ### Request body
 
-```js
-import { z } from "zod";
-
-export const myThingInputSchema = z.object({
-  name: z.string().min(1).max(255),
-  description: z.string().optional(),
-  quantity: z.number().int().min(0).default(0),
-  status: z.enum(["active", "archived"]),
-});
+```python
+class MyThingIn(CamelModel):
+    name: Annotated[str, Field(min_length=1, max_length=255)]
+    description: str | None = None
+    quantity: Annotated[int, Field(ge=0)] = 0
+    status: Literal["active", "archived"]
 ```
 
-### Query parameters (always coerce numbers and booleans)
+### Query parameters (strings are coerced to int/bool automatically)
 
-```js
-export const myThingQuerySchema = z.object({
-  search: z.string().optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(48).default(12),
-  status: z.enum(["active", "archived"]).optional(),
-});
+```python
+class MyThingQuery(CamelModel):
+    search: str | None = None
+    page: Annotated[int, Field(ge=1)] = 1
+    page_size: Annotated[int, Field(ge=1, le=48)] = 12   # ?pageSize=...
+    status: Literal["active", "archived"] | None = None
 ```
 
-### File upload metadata
+### Response
 
-```js
-export const fileMetaSchema = z.object({
-  alt: z.string().max(255).optional(),
-  sortOrder: z.coerce.number().int().min(0).default(0),
-});
+```python
+class MyThingOut(CamelModel):
+    id: int
+    name: str
+    created_at: UtcDatetime
 ```
 
-## Using safeParse in a route
+## Using it in a route
 
-```js
-import { myThingInputSchema } from "../validation/product.js";
+```python
+from app.schemas import MyThingIn, MyThingOut, MyThingQuery
 
-router.post("/", requireAdmin, async (req, res) => {
-  const result = myThingInputSchema.safeParse(req.body);
-  if (!result.success) {
-    return res.status(400).json({ errors: result.error.flatten() });
-  }
+@router.post("/things", response_model=MyThingOut, status_code=status.HTTP_201_CREATED)
+async def create_thing(body: MyThingIn, session: Session) -> Thing:
+    thing = Thing(name=body.name, quantity=body.quantity)
+    ...
 
-  // result.data is now typed and safe to use
-  const { name, description, quantity, status } = result.data;
-  // ...
-});
+@router.get("/things", response_model=list[MyThingOut])
+async def list_things(query: Annotated[MyThingQuery, Query()], session: Session): ...
 ```
 
-## `error.flatten()` response shape
+## Validation error response shape
+
+Produced by the handler in `app/main.py`:
 
 ```json
 {
-  "errors": {
-    "formErrors": [],
-    "fieldErrors": {
-      "name": ["Required"],
-      "quantity": ["Expected number, received string"]
-    }
-  }
+  "message": "Invalid body",
+  "issues": [
+    { "path": ["body", "quantity"], "message": "Input should be greater than or equal to 0", "type": "greater_than_equal" }
+  ]
 }
 ```
 
 ## Common mistakes to avoid
 
-- Do NOT use `.parse()` in route handlers — it throws and bypasses your error handler
-- Do NOT read `req.query.page` as a number without `z.coerce.number()` — it's always a string
-- Do NOT define schemas inline in route files — keep them in `validation/product.js`
-- Do NOT forget to export the schema and import it in the route
-- Do NOT add `.required()` — fields are required by default in Zod; use `.optional()` to opt out
+- Do NOT parse `await request.json()` manually — declare the model as a parameter
+- Do NOT subclass `BaseModel` directly for API schemas — use `CamelModel` or the JSON casing breaks
+- Do NOT define schemas inline in router files — keep them in `schemas.py`
+- Do NOT use `HttpUrl` for stored URLs — it normalizes them (e.g. adds a trailing slash); use the `Url` type

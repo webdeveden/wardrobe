@@ -1,127 +1,99 @@
 ---
-name: prisma-migration
-description: Modify the Prisma schema and create a database migration for the Wardrobe Catalog. Use this skill when adding models, columns, relations, indexes, or constraints. Enforces additive-only migrations, correct index placement, and safe deployment practices.
+name: alembic-migration
+description: Modify the SQLAlchemy models and create an Alembic database migration for the Wardrobe Catalog. Use this skill when adding models, columns, relations, indexes, or constraints. Enforces additive-only migrations, correct index placement, Prisma-compatible naming, and safe deployment practices.
 ---
 
-# Prisma Migration
+# Alembic Migration
 
 Use this skill when the user asks to change the database schema, add a model, add a column, add a relation, or create a migration.
 
 ## Checklist — every migration must have all of these
 
 - [ ] Migration is additive — adds or modifies, never removes columns/tables without deliberate data-loss review
-- [ ] Foreign keys have `@@index` entries for query performance
-- [ ] `@unique` used on slug, email, and any other business-unique fields
-- [ ] Timestamps use `@default(now())` for `createdAt` and `@updatedAt` for `updatedAt`
-- [ ] Cascade delete configured for records that must not outlive their parent
-- [ ] Migration created with `prisma migrate dev`, never by hand-editing SQL
-- [ ] Seeder updated if new required fields are added to existing seeded models
-- [ ] `prisma migrate status` checked before deploying
+- [ ] Foreign keys have an `Index(...)` in `__table_args__`
+- [ ] Unique indexes on slug, email, and other business-unique fields
+- [ ] New tables follow the existing naming: PascalCase table, camelCase columns, `<Table>_pkey`, `<Table>_<col>_key`, `<Table>_<col>_idx`, `<Table>_<col>_fkey`
+- [ ] Timestamps use `_created_at()` / `_updated_at()` helpers from `models.py`
+- [ ] Cascade delete configured (`ondelete="CASCADE"` on the child FK, `cascade="all, delete-orphan"` + `passive_deletes=True` on the parent relationship)
+- [ ] New relationships declared with `lazy="raise"`
+- [ ] Revision created with `--autogenerate` and then **reviewed by hand** (autogenerate misses some changes, e.g. enum values)
+- [ ] `alembic upgrade head` and `alembic downgrade -1` both tested locally
+- [ ] `app/seed.py` updated if new required fields are added to seeded models
 
 ## File locations
 
-- Schema: `backend/prisma/schema.prisma`
-- Migrations: `backend/prisma/migrations/`
-- Seeder: `backend/prisma/seed.js`
+- Models: `backend/app/models.py`
+- Migrations: `backend/alembic/versions/`
+- Alembic env: `backend/alembic/env.py` (reads `DATABASE_URL` via `app.config.settings`)
+- Seeder: `backend/app/seed.py`
 
-## Commands
+## Commands (run from `backend/` with the venv active)
 
 ```bash
-# Create a new migration (run from backend/)
-bun run prisma migrate dev --name "add-column-to-product"
+# Create a new migration after editing models.py
+alembic revision --autogenerate -m "add condition to product"
 
-# Check migration state
-bun run prisma migrate status
+# Apply / inspect
+alembic upgrade head
+alembic current
+alembic check          # fails if models and DB have drifted
 
-# Apply migrations in production
-bun run prisma migrate deploy
+# Roll back one step
+alembic downgrade -1
 
-# Inspect data in Prisma Studio
-bun run prisma studio
+# Re-seed
+python -m app.seed
 
-# Re-seed the database
-bun run prisma db seed
+# In Docker (migrations also run automatically on container start)
+docker compose exec backend alembic upgrade head
 ```
 
 ## Existing schema shape
 
-```prisma
-model User {
-  id           Int      @id @default(autoincrement())
-  email        String   @unique
-  passwordHash String
-  role         Role     @default(USER)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-}
-
-model Product {
-  id          Int            @id @default(autoincrement())
-  name        String
-  slug        String         @unique
-  description String?
-  aisle       String?
-  quantity    Int            @default(0)
-  categoryId  Int
-  eraId       Int
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
-  category    Category       @relation(fields: [categoryId], references: [id])
-  era         Era            @relation(fields: [eraId], references: [id])
-  images      ProductImage[]
-
-  @@index([categoryId])
-  @@index([eraId])
-  @@index([createdAt])
-  @@index([aisle])
-}
-
-model ProductImage {
-  id        Int     @id @default(autoincrement())
-  productId Int
-  url       String
-  alt       String?
-  sortOrder Int     @default(0)
-  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-
-  @@index([productId, sortOrder])
-}
+```text
+User         (id, email, passwordHash, role: Role[USER|ADMIN], createdAt, updatedAt)  unique: email
+Category     (id, name, slug, createdAt, updatedAt)                                     unique: name, slug
+Era          (id, name, slug, createdAt, updatedAt)                                     unique: name, slug
+Product      (id, name, slug, description, aisle, quantity, categoryId, eraId, createdAt, updatedAt)
+             unique: slug; indexes: categoryId, eraId, createdAt, aisle
+ProductImage (id, productId → Product ON DELETE CASCADE, url, alt?, sortOrder)
+             index: (productId, sortOrder)
 ```
 
 ## Adding a new column (safe pattern)
 
-```prisma
-model Product {
-  // existing fields ...
-  condition String? // nullable = safe to add without a default
-}
+```python
+class Product(Base):
+    # existing fields ...
+    condition: Mapped[str | None] = mapped_column(Text, nullable=True)  # nullable = safe on populated tables
 ```
 
-Then run:
+Then:
+
 ```bash
-bun run prisma migrate dev --name "add-condition-to-product"
+alembic revision --autogenerate -m "add condition to product"
 ```
 
-## Adding a new model with relations
+## Adding a new model with a relation
 
-```prisma
-model Tag {
-  id       Int       @id @default(autoincrement())
-  name     String    @unique
-  slug     String    @unique
-  products Product[] @relation("ProductTags")
-}
-```
+```python
+class Tag(Base):
+    __tablename__ = "Tag"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="Tag_pkey"),
+        Index("Tag_slug_key", "slug", unique=True),
+    )
 
-Add to `Product`:
-```prisma
-tags Tag[] @relation("ProductTags")
+    id: Mapped[int] = mapped_column(Integer, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text)
+    slug: Mapped[str] = mapped_column(Text)
 ```
 
 ## Common mistakes to avoid
 
-- Do NOT edit migration SQL files by hand
-- Do NOT add `@unique` to an existing column that has duplicates — clean the data first
-- Do NOT add a non-nullable column without a `@default` to a populated table
-- Do NOT omit `@@index` on foreign key columns
-- Do NOT use `onDelete: Cascade` on the parent side — it belongs on the child relation field
+- Do NOT change the database by hand — always go through a revision
+- Do NOT edit a revision that has already been applied anywhere; add a new one
+- Do NOT add a unique index to a column that currently has duplicates — clean the data first
+- Do NOT add a non-nullable column to a populated table without a `server_default`
+- Do NOT omit indexes on foreign key columns
+- Do NOT rename existing tables/columns to snake_case — the DB keeps its original Prisma-era names

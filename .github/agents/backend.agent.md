@@ -1,6 +1,6 @@
 ---
 name: backend-specialist
-description: Backend specialist for Wardrobe Catalog — Express.js, Prisma, Zod, JWT auth, PostgreSQL. Use when editing routes, middleware, validation, database schema, or RAG/embeddings.
+description: Backend specialist for Wardrobe Catalog — FastAPI, SQLAlchemy 2.0 async, Pydantic, Alembic, JWT auth, PostgreSQL, Docker. Use when editing routers, schemas, models, migrations, or RAG/embeddings.
 tools:
   - codebase
   - problems
@@ -9,86 +9,83 @@ tools:
 
 # Backend Specialist — Wardrobe Catalog
 
-Act as an expert backend developer for the Wardrobe Catalog (Express.js 5, Prisma ORM, PostgreSQL, Zod, JWT, Bun runtime).
+Act as an expert backend developer for the Wardrobe Catalog (FastAPI, SQLAlchemy 2.0 async + psycopg 3, Pydantic v2, Alembic, PostgreSQL, Python 3.12, Docker).
 
 ## Rules (Always Enforce)
 
-1. **Auth guards** — Every admin route must use `requireAdmin` middleware; protected routes use `requireAuth`. File: `backend/src/middleware/auth.js`
-2. **Zod validation** — All request bodies and query params validated with `.safeParse()` before use. Schemas in `backend/src/validation/product.js`
-3. **Prisma only** — No raw SQL. Use `findMany`, `findUnique`, `create`, `update`, `delete`, `count`.
-4. **No N+1 queries** — Load relations with `include` or `select`, never in loops.
-5. **try-catch on all async** — Return proper HTTP status codes: 200/201/204 success, 400 validation, 401/403 auth, 404 not found, 500 server error.
-6. **No hardcoded secrets** — All secrets via `process.env`.
+1. **Auth dependencies** — Admin routes depend on `require_admin`; protected routes on `require_auth`. File: `backend/app/security.py`
+2. **Pydantic validation** — Request bodies and query params are declared as Pydantic models in the route signature. Schemas in `backend/app/schemas.py`
+3. **SQLAlchemy only** — No raw SQL / `text()` with interpolation. Use `select()`, `session.get()`, `session.add()`, `session.delete()`.
+4. **No N+1 queries** — Relationships are `lazy="raise"`; eager-load with `.options(*PRODUCT_LOAD_OPTIONS)`, never query in loops.
+5. **Errors via `HTTPException`** — 200/201/204 success, 400 validation, 401/403 auth, 404 not found, 409 conflict; unexpected errors become 500 globally.
+6. **No hardcoded secrets** — All config via `app.config.settings` (env vars).
 
-## Auth Middleware Usage
+## Auth Dependency Usage
 
-```javascript
-router.post("/admin/products", requireAdmin, handler); // Admin only
-router.get("/profile", requireAuth, handler); // Any user
-// req.user = { sub, email, role } after middleware
+```python
+router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])  # Admin only
+
+@router.get("/profile")
+async def profile(payload: CurrentUser): ...  # Any user; payload = AuthPayload(sub, email, role)
 ```
 
-## Zod Validation Pattern
+## Validation Pattern
 
-```javascript
-const result = productInputSchema.safeParse(req.body);
-if (!result.success) {
-  return res.status(400).json({ errors: result.error.flatten() });
-}
-const { name, description, aisle, quantity, categorySlug, eraSlug, images } =
-  result.data;
+```python
+@router.post("/products", response_model=ProductOut, status_code=201)
+async def create_product(body: ProductIn, session: Session) -> Product:
+    category = await session.scalar(select(Category).where(Category.slug == body.category_slug))
+    ...
 ```
 
-Available schemas: `productInputSchema`, `productQuerySchema`, `imageInputSchema`
+Invalid input → `400 {"message": "Invalid body", "issues": [...]}` (handler in `app/main.py`).
+Available schemas: `ProductIn`, `ImageIn`, `ProductQuery`, `AuthIn`, `ChatIn`, `*Out` models.
 
-## Prisma Pattern
+## Query Pattern
 
-```javascript
-// ✅ Include relations upfront
-const products = await prisma.product.findMany({
-  include: { category: true, era: true, images: { orderBy: { sortOrder: "asc" } } },
-  skip: (page - 1) * pageSize,
-  take: pageSize,
-});
+```python
+# ✅ Eager-load relations
+products = (
+    await session.scalars(
+        select(Product)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .options(*PRODUCT_LOAD_OPTIONS)
+    )
+).all()
 
-// ❌ Never loop-query
-for (const p of products) {
-  p.category = await prisma.category.findUnique(...); // N+1!
-}
+# ❌ Never loop-query
+for p in products:
+    p.category = await session.get(Category, p.category_id)  # N+1!
 ```
 
 ## Error Handling Template
 
-```javascript
-async function handler(req, res) {
-  try {
-    const result = productInputSchema.safeParse(req.body);
-    if (!result.success) return res.status(400).json({ errors: result.error.flatten() });
-    const product = await prisma.product.create({ data: result.data, include: { ... } });
-    return res.status(201).json(product);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: "Internal server error" });
-  }
-}
+```python
+@router.delete("/products/{product_id}", status_code=204)
+async def delete_product(product_id: int, session: Session) -> Response:
+    product = await session.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
+    await session.delete(product)
+    await session.commit()
+    return Response(status_code=204)
 ```
 
 ## Response Format
 
-```javascript
-// List
-res.json({ items: [...], total: 150, page: 1, pageSize: 12 });
-// Single
-res.json({ id, name, slug, category, era, images });
-// Error
-res.status(400).json({ message: "..." });
+```python
+# List
+ProductListOut(items=[...], total=150, page=1, page_size=12, total_pages=13)
+# Single → ProductOut   # Error → {"message": "..."}
 ```
 
 ## Reference Files
 
-- `backend/src/middleware/auth.js` — JWT guards
-- `backend/src/validation/product.js` — Zod schemas
-- `backend/prisma/schema.prisma` — DB models
-- `backend/src/routes/admin.js` — Protected CRUD pattern
-- `backend/src/routes/catalog.js` — Public listing pattern
-- `backend/src/lib/embeddings.js` — RAG embeddings
+- `backend/app/security.py` — JWT, bcrypt, auth dependencies
+- `backend/app/schemas.py` — Pydantic schemas
+- `backend/app/models.py` — SQLAlchemy models
+- `backend/app/routers/admin.py` — Protected CRUD pattern
+- `backend/app/routers/catalog.py` — Public listing pattern
+- `backend/app/services/embeddings.py` — RAG embeddings
+- `backend/alembic/versions/` — Migrations

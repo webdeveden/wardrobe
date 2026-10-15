@@ -12,11 +12,22 @@ CLAUDE.md                              ← Project-wide instructions (Claude Cod
   agents/
     backend.md                         ← Backend Specialist (Claude Code sub-agent)
     frontend.md                        ← Frontend Specialist (Claude Code sub-agent)
+  commands/
+    review.md                          ← /review slash command
 .github/
-  copilot-instructions.md              ← Symlink to CLAUDE.md (Copilot auto-reads this)
-  prompts/
-    backend.prompt.md                  ← Backend guidance (attach in Copilot Chat)
-    frontend.prompt.md                 ← Frontend guidance (attach in Copilot Chat)
+  copilot-instructions.md              ← Optional symlink to CLAUDE.md (see below)
+  agents/
+    backend.agent.md                   ← Backend specialist (Copilot custom agent)
+    frontend.agent.md                  ← Frontend specialist (Copilot custom agent)
+  instructions/
+    backend.instructions.md            ← Auto-applied to backend/**/*.py
+    frontend.instructions.md           ← Auto-applied to frontend code
+  skills/
+    add-api-route/                     ← New FastAPI endpoint
+    add-pydantic-schema/               ← New request/response schema
+    alembic-migration/                 ← Model change + migration
+    add-vue-component/                 ← New Vue component
+    code-review/                       ← Review checklist
 ```
 
 ---
@@ -27,7 +38,7 @@ Claude Code automatically picks up agents from `.claude/agents/`. It selects the
 
 | Agent | File | Activates for |
 |-------|------|--------------|
-| Backend Specialist | `.claude/agents/backend.md` | `backend/src/`, `backend/prisma/` |
+| Backend Specialist | `.claude/agents/backend.md` | `backend/app/`, `backend/alembic/`, `backend/tests/` |
 | Frontend Specialist | `.claude/agents/frontend.md` | `frontend/src/` |
 
 **Verify agents are loaded**: run `/agents` in Claude Code.
@@ -35,13 +46,15 @@ Claude Code automatically picks up agents from `.claude/agents/`. It selects the
 ### What each agent handles
 
 **Backend Specialist** (`backend.md`):
-- Express route creation & middleware
-- Prisma ORM queries & database interactions
-- Zod input validation & sanitization
-- JWT authentication & authorization guards
+- FastAPI routers & auth dependencies
+- SQLAlchemy 2.0 async queries & eager loading
+- Pydantic input/output schemas
+- Alembic migrations
+- JWT authentication & authorization
 - Error handling & HTTP status codes
 - N+1 query prevention
 - Chat/embeddings & semantic search patterns
+- Backend Dockerfile / compose service
 
 **Frontend Specialist** (`frontend.md`):
 - Vue 3 Composition API components
@@ -56,14 +69,11 @@ Claude Code automatically picks up agents from `.claude/agents/`. It selects the
 
 ## GitHub Copilot
 
-Copilot automatically reads `.github/copilot-instructions.md` (symlinked to `CLAUDE.md`) for project-wide context.
+Copilot reads `.github/copilot-instructions.md` for project-wide context (create the symlink below so it mirrors `CLAUDE.md`).
 
-For specialist guidance, attach prompt files manually in Copilot Chat:
-
-```
-#file:.github/prompts/backend.prompt.md  → Backend expertise
-#file:.github/prompts/frontend.prompt.md → Frontend expertise
-```
+- **Path-scoped rules**: `.github/instructions/*.instructions.md` apply automatically via their `applyTo` globs
+- **Custom agents**: pick `backend-specialist` / `frontend-specialist` from `.github/agents/`
+- **Skills**: `.github/skills/*/SKILL.md` are loaded when the task matches their description
 
 ---
 
@@ -80,23 +90,26 @@ The target path (`../CLAUDE.md`) is relative to where the link lives (`.github/`
 
 ## Keeping Instructions Updated
 
-All instructions live in three places. Here's what to update when:
+Instructions live in a few places. Here's what to update when:
 
 | Change | Update |
 |--------|--------|
 | New project-wide convention | `CLAUDE.md` (Copilot picks it up via symlink) |
-| New backend pattern/red flag | `.claude/agents/backend.md` + `.github/prompts/backend.prompt.md` |
-| New frontend pattern/red flag | `.claude/agents/frontend.md` + `.github/prompts/frontend.prompt.md` |
+| New backend pattern/red flag | `.claude/agents/backend.md` + `.github/agents/backend.agent.md` + `.github/instructions/backend.instructions.md` |
+| New frontend pattern/red flag | `.claude/agents/frontend.md` + `.github/agents/frontend.agent.md` + `.github/instructions/frontend.instructions.md` |
+| New repeatable workflow | `.github/skills/<name>/SKILL.md` |
 
 ---
 
 ## Reference Files
 
-- `backend/src/middleware/auth.js` — JWT verification & guards
-- `backend/src/validation/product.js` — Zod schemas
-- `backend/prisma/schema.prisma` — Database models & indexes
-- `backend/src/routes/admin.js` — Protected endpoint patterns
-- `backend/src/routes/catalog.js` — Public endpoint patterns
+- `backend/app/security.py` — JWT, bcrypt, `require_auth` / `require_admin`
+- `backend/app/schemas.py` — Pydantic schemas
+- `backend/app/models.py` — SQLAlchemy models & indexes
+- `backend/alembic/versions/` — Migrations
+- `backend/app/routers/admin.py` — Protected endpoint patterns
+- `backend/app/routers/catalog.py` — Public endpoint patterns
+- `docker-compose.yml` — Local stack (db, backend, frontend)
 - `frontend/src/stores/auth.js` — Auth state management
 - `frontend/src/api/client.js` — API client & axios config
 - `frontend/src/router.js` — Routes & auth guards

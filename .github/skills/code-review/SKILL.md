@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review Wardrobe Catalog code changes for correctness, security, and project conventions. Use this skill when the user asks to review a file, a diff, or a PR. Checks backend routes, Vue components, Prisma schema changes, and Zod validation against the project's standards.
+description: Review Wardrobe Catalog code changes for correctness, security, and project conventions. Use this skill when the user asks to review a file, a diff, or a PR. Checks FastAPI routes, Vue components, SQLAlchemy/Alembic schema changes, and Pydantic validation against the project's standards.
 ---
 
 # Code Review
@@ -21,31 +21,33 @@ Use this skill when the user asks to review code, check a diff, or audit a file 
 
 ### Auth & security
 
-- [ ] Every non-public route uses `requireAuth` or `requireAdmin`
-- [ ] Admin routes use `requireAdmin`, not just `requireAuth`
-- [ ] All `req.body` / `req.query` input parsed with a Zod schema before use
-- [ ] `.safeParse()` used (not `.parse()`) with a 400 response on failure
-- [ ] No secrets hardcoded — all from `process.env`
-- [ ] No raw SQL — only Prisma ORM methods
+- [ ] Every non-public route depends on `require_auth` or `require_admin`
+- [ ] Admin routes use `require_admin`, not just `require_auth`
+- [ ] All bodies / query params declared as Pydantic models (no manual `request.json()`)
+- [ ] File uploads parsed after the auth dependency runs, with size/count/type limits
+- [ ] No secrets hardcoded — all from `app.config.settings`
+- [ ] No raw SQL or `text()` with interpolated values — only SQLAlchemy expressions
 
 ### Correctness
 
-- [ ] All async route handlers have `try-catch` with a 500 fallback
-- [ ] Response includes an explicit status code on every branch
-- [ ] Prisma errors don't leak stack traces to the client
-- [ ] `findUnique` results checked for `null` before use (return 404 if missing)
+- [ ] Expected failures raised as `HTTPException`; unique-constraint `IntegrityError` → 409 with rollback
+- [ ] `response_model` and `status_code` set on the route decorator
+- [ ] Database errors don't leak stack traces to the client (global handler returns a generic 500)
+- [ ] `session.get()` / `scalar()` results checked for `None` before use (404 if missing)
+- [ ] No blocking calls inside `async def` (use `run_in_threadpool`)
 
 ### Performance
 
-- [ ] Related data fetched with `include`, never inside a loop
-- [ ] `findMany` calls have a `take` limit to avoid unbounded results
-- [ ] New foreign key columns have a matching `@@index` in schema.prisma
+- [ ] Related data eager-loaded with `.options(...)`, never queried inside a loop
+- [ ] List queries have a `.limit()` to avoid unbounded results
+- [ ] New foreign key columns have a matching `Index(...)` in the model's `__table_args__`
 
 ### Conventions
 
-- [ ] Route file is in the correct location (`catalog.js`, `admin.js`, `auth.js`, `chat.js`)
-- [ ] New Zod schemas added to `backend/src/validation/product.js`, not inline
-- [ ] Response shape is consistent `{ data }` or `{ message }` — not a mix
+- [ ] Route is in the correct router (`app/routers/catalog.py`, `admin.py`, `auth.py`, `chat.py`)
+- [ ] New schemas added to `backend/app/schemas.py` and extend `CamelModel`, not defined inline
+- [ ] Errors use the `{ message }` shape; success bodies match a declared `*Out` model
+- [ ] Admin writes that change products call `invalidate_product_embeddings()`
 
 ---
 
@@ -78,11 +80,13 @@ Use this skill when the user asks to review code, check a diff, or audit a file 
 
 ## Database / schema review checklist
 
+- [ ] Every model change has an Alembic revision in `backend/alembic/versions/`, reviewed by hand
 - [ ] Migration is additive (no dropped columns without deliberate review)
-- [ ] Non-nullable columns added to existing tables have a `@default`
-- [ ] `@unique` not added to a column that currently has duplicates
-- [ ] `onDelete: Cascade` on the child relation field (not the parent)
-- [ ] `@@index` present on all foreign key columns
+- [ ] Non-nullable columns added to existing tables have a `server_default`
+- [ ] Unique index not added to a column that currently has duplicates
+- [ ] `ondelete="CASCADE"` on the child FK; parent relationship uses `passive_deletes=True`
+- [ ] Indexes present on all foreign key columns
+- [ ] `downgrade()` implemented
 
 ---
 

@@ -52,6 +52,13 @@ uploads/
 /backend/uploads/
 /frontend/uploads/
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
 # Coverage and test outputs
 coverage/
 .nyc_output/

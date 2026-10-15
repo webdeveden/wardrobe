@@ -5,7 +5,13 @@ import { useRoute, useRouter } from "vue-router";
 import ChatModal from "./components/ChatModal.vue";
 import LoginModal from "./components/LoginModal.vue";
 import { chatOpen } from "./stores/catalog";
-import { isAdmin, isLoggedIn, clearAuth, setAuth, authUser } from "./stores/auth";
+import {
+  isAdmin,
+  isLoggedIn,
+  clearAuth,
+  setAuth,
+  authUser,
+} from "./stores/auth";
 
 const THEME_STORAGE_KEY = "wardrobe-theme";
 const SEARCH_DEBOUNCE_MS = 350;
@@ -44,7 +50,9 @@ watch(isAdmin, (admin) => {
 onMounted(() => {
   // Refresh token on load so DB role changes (e.g. ADMIN promotion) take effect without re-login
   if (isLoggedIn.value) {
-    fetchMe().then(({ token, user }) => setAuth(token, user)).catch(() => clearAuth());
+    fetchMe()
+      .then(({ token, user }) => setAuth(token, user))
+      .catch(() => clearAuth());
   }
 
   const stored = localStorage.getItem(THEME_STORAGE_KEY);
@@ -135,6 +143,9 @@ onBeforeUnmount(() => {
           class="text-sm uppercase tracking-[0.35em] text-slate-700 dark:text-slate-300"
           >Wardrobe House</RouterLink
         >
+        <span class="text-xs pl-3 pt-1 text-slate-500 dark:text-slate-400"
+          >V1.0.0</span
+        >
         <nav
           class="ml-auto flex items-center gap-3 text-sm text-slate-700 dark:text-slate-300 md:gap-5"
         >
@@ -155,19 +166,24 @@ onBeforeUnmount(() => {
               <span
                 class="flex h-7 w-7 items-center justify-center rounded-full bg-amber-700 text-xs font-semibold uppercase text-white dark:bg-amber-600"
                 :title="authUser?.email"
-              >{{ authUser?.email?.[0] }}</span>
+                >{{ authUser?.email?.[0] }}</span
+              >
               <button
                 type="button"
                 @click="clearAuth"
                 class="hover:text-amber-800 dark:hover:text-amber-400"
-              >Logout</button>
+              >
+                Logout
+              </button>
             </div>
             <button
               v-else
               type="button"
               @click="loginOpen = true"
               class="hover:text-amber-800 dark:hover:text-amber-400"
-            >Login</button>
+            >
+              Login
+            </button>
           </div>
 
           <!-- Chat Button -->
@@ -324,20 +340,31 @@ onBeforeUnmount(() => {
                     <span
                       class="flex h-6 w-6 items-center justify-center rounded-full bg-amber-700 text-xs font-semibold uppercase text-white dark:bg-amber-600"
                       :title="authUser?.email"
-                    >{{ authUser?.email?.[0] }}</span>
+                      >{{ authUser?.email?.[0] }}</span
+                    >
                     <button
                       type="button"
                       class="text-sm hover:text-amber-800 dark:hover:text-amber-400"
-                      @click="clearAuth(); menuOpen = false"
-                    >Logout</button>
+                      @click="
+                        clearAuth();
+                        menuOpen = false;
+                      "
+                    >
+                      Logout
+                    </button>
                   </div>
                 </template>
                 <button
                   v-else
                   type="button"
                   class="block text-sm hover:text-amber-800 dark:hover:text-amber-400"
-                  @click="loginOpen = true; menuOpen = false"
-                >Login</button>
+                  @click="
+                    loginOpen = true;
+                    menuOpen = false;
+                  "
+                >
+                  Login
+                </button>
               </div>
             </div>
           </div>
